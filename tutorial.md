@@ -6,8 +6,8 @@ This creates **one VM running Aavaz PBX** (Ubuntu 24.04, 4 GB RAM) with a fixed 
 network. The firewall opens only what a PBX needs: web (80/443), SSH (22), SIP (UDP 5060) and call
 audio (UDP 10000–20000).
 
-Cost is roughly **US$37/month** in Mumbai for the default `e2-medium`. Delete it any time with one
-command (last step).
+Cost is roughly **US$31/month** for the default `e2-medium` in the default region (us-east1); other
+regions cost a little more (Mumbai is about US$37). Delete it any time with one command (last step).
 
 Click **Start** to begin.
 
@@ -23,18 +23,38 @@ Then make it the current project:
 gcloud config set project <walkthrough-project-id/>
 ```
 
-## Deploy
+## Pick a region and deploy
 
-Pick the zone nearest your phones and SIP provider:
+Choose the zone **nearest your phones and your SIP provider**. Call quality depends on it. The default
+is **us-east1-b**.
 
-| Zone | Location |
-|------|----------|
-| `asia-south1-a` | Mumbai (default) |
-| `asia-southeast1-a` | Singapore |
-| `europe-west3-a` | Frankfurt |
-| `us-east1-b` | South Carolina |
+| Area | Zone | Location |
+|------|------|----------|
+| Americas | `us-east1-b` | South Carolina (**default**) |
+| | `us-east4-a` | Northern Virginia |
+| | `us-central1-a` | Iowa |
+| | `us-west1-a` | Oregon |
+| | `northamerica-northeast1-a` | Montréal |
+| | `southamerica-east1-a` | São Paulo |
+| Europe | `europe-west2-a` | London |
+| | `europe-west1-b` | Belgium |
+| | `europe-west3-a` | Frankfurt |
+| Middle East | `me-central1-a` | Doha |
+| Asia Pacific | `asia-south1-a` | Mumbai |
+| | `asia-south2-a` | Delhi |
+| | `asia-southeast1-a` | Singapore |
+| | `asia-northeast1-a` | Tokyo |
+| | `australia-southeast1-a` | Sydney |
 
-Run (change the zone if needed):
+Any other zone works too (`gcloud compute zones list`).
+
+Deploy in the default zone:
+
+```sh
+./gcp-deploy.sh
+```
+
+Or in another zone, by changing the zone name:
 
 ```sh
 ./gcp-deploy.sh --zone asia-south1-a
@@ -50,18 +70,18 @@ The PBX finishes installing about **3 minutes** after the script ends.
 2. Log in as **admin / admin**. You'll be asked to set a new password straight away.
 3. Choose **Cloud** as the deployment mode, then **open your current IP for SIP** so your phones can register.
 
-To watch the install:
+To watch the install (use your zone):
 
 ```sh
-gcloud compute ssh aavaz-pbx --zone asia-south1-a --command 'sudo tail -f /var/log/cloud-init-output.log'
+gcloud compute ssh aavaz-pbx --zone us-east1-b --command 'sudo tail -f /var/log/cloud-init-output.log'
 ```
 
 ## Remove it
 
-Deletes the VM, its network, firewall rules and static IP:
+Deletes the VM, its network, firewall rules and static IP (use the same zone you deployed in):
 
 ```sh
-./gcp-deploy.sh --zone asia-south1-a --delete
+./gcp-deploy.sh --zone us-east1-b --delete
 ```
 
 ## Done

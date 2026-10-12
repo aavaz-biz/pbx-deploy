@@ -6,7 +6,7 @@
 #   as AWS), which runs the hosted installer and sets the NAT address.
 #   Runs in Cloud Shell or anywhere gcloud is logged in.
 # Usage:
-#   gcp-deploy.sh [--project ID] [--zone asia-south1-a] [--name aavaz-pbx]
+#   gcp-deploy.sh [--project ID] [--zone us-east1-b] [--name aavaz-pbx]
 #                 [--machine-type e2-medium] [--disk-size 30] [--ssh-cidr CIDR]
 #   gcp-deploy.sh [--project ID] [--zone Z] [--name N] --delete
 #   curl -fsSL https://resources.aavaz.biz/install/gcp-deploy.sh | bash -s -- [options]
@@ -29,7 +29,7 @@ readonly RTP_RANGE="10000-20000"          # must match etc-ast/rtp.conf
 readonly IAP_RANGE="35.235.240.0/20"      # console "SSH" button (IAP)
 
 PROJECT=""
-ZONE="asia-south1-a"
+ZONE="us-east1-b"
 NAME="aavaz-pbx"
 MACHINE_TYPE="e2-medium"
 DISK_SIZE_GB=30
@@ -43,13 +43,20 @@ Deploy (or delete) Aavaz PBX on Google Cloud: an Ubuntu 24.04 VM with a static I
 in its own network; firewall opens only TCP 22/80/443, UDP 5060 and 10000-20000.
 
 Usage:
-  gcp-deploy.sh [--project ID] [--zone asia-south1-a] [--name aavaz-pbx]
+  gcp-deploy.sh [--project ID] [--zone us-east1-b] [--name aavaz-pbx]
                 [--machine-type e2-medium] [--disk-size 30] [--ssh-cidr CIDR]
   gcp-deploy.sh [--project ID] [--zone Z] [--name N] --delete
 
 --project defaults to gcloud's current project (the one selected in Cloud Shell).
-Pick the zone nearest your phones and SIP provider, e.g. asia-south1-a (Mumbai),
-asia-southeast1-a (Singapore), europe-west3-a (Frankfurt), us-east1-b (S. Carolina).
+--zone defaults to us-east1-b. Pick the zone nearest your phones and SIP provider:
+  Americas : us-east1-b (S. Carolina), us-east4-a (N. Virginia), us-central1-a (Iowa),
+             us-west1-a (Oregon), northamerica-northeast1-a (Montreal),
+             southamerica-east1-a (Sao Paulo)
+  Europe   : europe-west2-a (London), europe-west1-b (Belgium), europe-west3-a (Frankfurt)
+  Mid-East : me-central1-a (Doha)
+  Asia/Pac : asia-south1-a (Mumbai), asia-south2-a (Delhi), asia-southeast1-a (Singapore),
+             asia-northeast1-a (Tokyo), australia-southeast1-a (Sydney)
+Full list: gcloud compute zones list
 EOF
 }
 
