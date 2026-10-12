@@ -34,7 +34,8 @@ curl -fsSL https://resources.aavaz.biz/install/gcp-deploy.sh | bash -s -- --proj
 | Tokyo | `ap-northeast-1` | [![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home?region=ap-northeast-1#/stacks/create/review?templateURL=https://aavaz-pbx-install.s3.amazonaws.com/install/aws-cloudformation.yaml&stackName=aavaz-pbx) |
 | Sydney | `ap-southeast-2` | [![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home?region=ap-southeast-2#/stacks/create/review?templateURL=https://aavaz-pbx-install.s3.amazonaws.com/install/aws-cloudformation.yaml&stackName=aavaz-pbx) |
 
-On the page that opens, pick your **VPC and a public subnet** (an EC2 key pair is optional), then **Create stack**.
+On the page that opens, leave the defaults (an EC2 key pair is optional) and click
+**Create stack**. The stack creates its own small network, so there is no VPC or subnet to pick.
 Check the region (top right) **before** filling in the form.
 
 ## After it's up

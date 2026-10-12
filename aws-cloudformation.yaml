@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  Aavaz PBX on Ubuntu 24.04 LTS - one EC2 instance with an Elastic IP and a
-  security group that exposes only SSH, HTTP/HTTPS, SIP and RTP.
+  Aavaz PBX on Ubuntu 24.04 LTS - one EC2 instance with an Elastic IP, in its
+  own small VPC, with a security group that exposes only SSH, HTTP/HTTPS, SIP
+  and RTP.
 
 # -----------------------------------------------------------------------------
 # Exposure contract (cloud): TCP 22, 80, 443 + UDP 5060 (SIP), 10000-20000 (RTP).
@@ -9,9 +10,17 @@ Description: >-
 # restricts it to the IPs the admin opens in the management app.
 # RTP range must match deployment/asterisk/etc-ast/rtp.conf.
 #
+# The stack creates its own VPC (10.80.0.0/16, one public subnet), so there is
+# no VPC/subnet to pick. The subnet is pinned by Availability Zone ID (the same
+# in every account, unlike zone names) to a zone that offers all t3 sizes:
+# some zones don't (e.g. use1-az3, often named us-east-1e), and an instance
+# type the zone lacks fails the stack. Checked 2026-10-12 with
+# describe-instance-type-offerings; az1 has t3.small..xlarge in all 12 regions.
+# A region not in RegionZone fails at once with a mapping error.
+#
 # The Elastic IP is attached to the network interface BEFORE the instance
-# boots, so first-boot downloads work in subnets without auto-assigned public
-# IPs, and the IP the PBX sees is already its final one.
+# boots, so first-boot downloads work, and the IP the PBX sees is already
+# its final one.
 # -----------------------------------------------------------------------------
 
 Metadata:
@@ -20,15 +29,13 @@ Metadata:
       - Label: { default: Server }
         Parameters: [InstanceType, DiskSizeGb, KeyName]
       - Label: { default: Network }
-        Parameters: [VpcId, SubnetId, SshCidr]
+        Parameters: [SshCidr]
       - Label: { default: Advanced (leave as is) }
         Parameters: [UbuntuAmi]
     ParameterLabels:
       InstanceType: { default: Instance size }
       DiskSizeGb: { default: Disk size (GB) - holds recordings and databases }
       KeyName: { default: SSH key pair name (optional) }
-      VpcId: { default: VPC }
-      SubnetId: { default: Public subnet (must route to an internet gateway) }
       SshCidr: { default: Who may SSH in (CIDR) }
 
 Parameters:
@@ -52,11 +59,6 @@ Parameters:
     Description: >-
       Optional. Name of an existing EC2 key pair in this region for SSH (user 'ubuntu').
       Leave empty and use the console's "Connect > EC2 Instance Connect" instead.
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-  SubnetId:
-    Type: AWS::EC2::Subnet::Id
-    Description: Must be in the VPC above.
   SshCidr:
     Type: String
     Default: 0.0.0.0/0
@@ -67,15 +69,82 @@ Parameters:
     Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
     Description: Canonical's public SSM parameter for the latest Ubuntu 24.04 LTS (amd64).
 
+Mappings:
+  # Zone ID per region that offers t3.small, t3.medium, t3.large and t3.xlarge.
+  RegionZone:
+    us-east-1: { ZoneId: use1-az1 }
+    us-east-2: { ZoneId: use2-az1 }
+    us-west-2: { ZoneId: usw2-az1 }
+    ca-central-1: { ZoneId: cac1-az1 }
+    sa-east-1: { ZoneId: sae1-az1 }
+    eu-west-1: { ZoneId: euw1-az1 }
+    eu-west-2: { ZoneId: euw2-az1 }
+    eu-central-1: { ZoneId: euc1-az1 }
+    ap-south-1: { ZoneId: aps1-az1 }
+    ap-southeast-1: { ZoneId: apse1-az1 }
+    ap-northeast-1: { ZoneId: apne1-az1 }
+    ap-southeast-2: { ZoneId: apse2-az1 }
+
 Conditions:
   HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
 
 Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.80.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-pbx" }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-pbx" }
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.80.0.0/24
+      AvailabilityZoneId: !FindInMap [RegionZone, !Ref "AWS::Region", ZoneId]
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-pbx" }
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-pbx" }
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet
+      RouteTableId: !Ref RouteTable
+
   SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Aavaz PBX - SSH, HTTP/HTTPS, SIP, RTP
-      VpcId: !Ref VpcId
+      VpcId: !Ref Vpc
       SecurityGroupIngress:
         - { IpProtocol: tcp, FromPort: 22,    ToPort: 22,    CidrIp: !Ref SshCidr, Description: SSH }
         - { IpProtocol: tcp, FromPort: 80,    ToPort: 80,    CidrIp: 0.0.0.0/0,   Description: HTTP (redirects to HTTPS) }
@@ -88,7 +157,7 @@ Resources:
   NetworkInterface:
     Type: AWS::EC2::NetworkInterface
     Properties:
-      SubnetId: !Ref SubnetId
+      SubnetId: !Ref Subnet
       GroupSet: [!Ref SecurityGroup]
       Tags:
         - { Key: Name, Value: !Sub "${AWS::StackName}-pbx" }
@@ -102,6 +171,7 @@ Resources:
 
   ElasticIpAssociation:
     Type: AWS::EC2::EIPAssociation
+    DependsOn: GatewayAttachment  # an EIP needs the VPC's internet gateway
     Properties:
       AllocationId: !GetAtt ElasticIp.AllocationId
       NetworkInterfaceId: !Ref NetworkInterface
@@ -265,7 +335,8 @@ Resources:
 
   Instance:
     Type: AWS::EC2::Instance
-    DependsOn: ElasticIpAssociation
+    # Internet must work at first boot: cloud-init downloads the installer.
+    DependsOn: [ElasticIpAssociation, DefaultRoute, SubnetRouteTable]
     Properties:
       LaunchTemplate:
         LaunchTemplateId: !Ref LaunchTemplate
