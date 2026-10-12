@@ -1,0 +1,291 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Aavaz PBX on Ubuntu 24.04 LTS - one EC2 instance with an Elastic IP and a
+  security group that exposes only SSH, HTTP/HTTPS, SIP and RTP.
+
+# -----------------------------------------------------------------------------
+# Exposure contract (cloud): TCP 22, 80, 443 + UDP 5060 (SIP), 10000-20000 (RTP).
+# Nothing else. SIP is open to all here; the PBX's own iptables allow-list
+# restricts it to the IPs the admin opens in the management app.
+# RTP range must match deployment/asterisk/etc-ast/rtp.conf.
+#
+# The Elastic IP is attached to the network interface BEFORE the instance
+# boots, so first-boot downloads work in subnets without auto-assigned public
+# IPs, and the IP the PBX sees is already its final one.
+# -----------------------------------------------------------------------------
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Server }
+        Parameters: [InstanceType, DiskSizeGb, KeyName]
+      - Label: { default: Network }
+        Parameters: [VpcId, SubnetId, SshCidr]
+      - Label: { default: Advanced (leave as is) }
+        Parameters: [UbuntuAmi]
+    ParameterLabels:
+      InstanceType: { default: Instance size }
+      DiskSizeGb: { default: Disk size (GB) - holds recordings and databases }
+      KeyName: { default: SSH key pair name (optional) }
+      VpcId: { default: VPC }
+      SubnetId: { default: Public subnet (must route to an internet gateway) }
+      SshCidr: { default: Who may SSH in (CIDR) }
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large, t3.xlarge]
+    Description: t3.medium (4 GB) recommended. t3.small (2 GB) works for small offices (tested 2026-10-12).
+  DiskSizeGb:
+    Type: Number
+    Default: 30
+    MinValue: 10
+    MaxValue: 2000
+  # Plain String (not AWS::EC2::KeyPair::KeyName) so it can be left empty: a
+  # junior admin often has no key pair. Without one, use the console's
+  # Connect -> EC2 Instance Connect (Ubuntu AMIs ship it; needs SSH open to
+  # AWS's EC2 Instance Connect range, which the default 0.0.0.0/0 covers).
+  KeyName:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional. Name of an existing EC2 key pair in this region for SSH (user 'ubuntu').
+      Leave empty and use the console's "Connect > EC2 Instance Connect" instead.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Must be in the VPC above.
+  SshCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: An IPv4 CIDR, e.g. 203.0.113.10/32
+  UbuntuAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Canonical's public SSM parameter for the latest Ubuntu 24.04 LTS (amd64).
+
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
+
+Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aavaz PBX - SSH, HTTP/HTTPS, SIP, RTP
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22,    ToPort: 22,    CidrIp: !Ref SshCidr, Description: SSH }
+        - { IpProtocol: tcp, FromPort: 80,    ToPort: 80,    CidrIp: 0.0.0.0/0,   Description: HTTP (redirects to HTTPS) }
+        - { IpProtocol: tcp, FromPort: 443,   ToPort: 443,   CidrIp: 0.0.0.0/0,   Description: Management UI and web phone }
+        - { IpProtocol: udp, FromPort: 5060,  ToPort: 5060,  CidrIp: 0.0.0.0/0,   Description: SIP (PBX allow-list filters sources) }
+        - { IpProtocol: udp, FromPort: 10000, ToPort: 20000, CidrIp: 0.0.0.0/0,   Description: RTP media }
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-pbx" }
+
+  NetworkInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref SubnetId
+      GroupSet: [!Ref SecurityGroup]
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-pbx" }
+
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-pbx" }
+
+  ElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ElasticIp.AllocationId
+      NetworkInterfaceId: !Ref NetworkInterface
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref UbuntuAmi
+        InstanceType: !Ref InstanceType
+        KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+        NetworkInterfaces:
+          - { DeviceIndex: 0, NetworkInterfaceId: !Ref NetworkInterface }
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: !Ref DiskSizeGb
+              VolumeType: gp3
+              Encrypted: true
+        # IMDSv2 only. The PBX does not use instance metadata (it learns its
+        # public IP from the Aavaz Store), so this costs nothing.
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+        # Verbatim copy of cloud-init.yaml (no !Sub: the script's ${...} must reach bash as-is).
+        UserData:
+          Fn::Base64: |
+            #cloud-config
+            # =============================================================================
+            # Aavaz PBX - cloud first boot (Ubuntu 24.04 LTS only)
+            # =============================================================================
+            # Paste as "user data" on any cloud. gcp-deploy.sh passes this file as GCE
+            # user-data metadata; aws-cloudformation.yaml embeds a verbatim copy (a Launch
+            # Stack template must be self-contained): change both together.
+            #
+            # All install logic stays in the hosted installer (the one Docker Hub points
+            # to); this file only:
+            #   1. refuses any OS other than Ubuntu 24.04 (the one tested host)
+            #   2. runs the installer unattended (--yes: with no terminal its prompts
+            #      default to "no" and it aborts)
+            #   3. WORKAROUND: writes the public IP into pjsip.conf so calls have audio.
+            #      Cloud VMs only see their private IP; without external_media_address
+            #      Asterisk advertises it in SDP and RTP goes nowhere (tested 2026-10-12).
+            #      The PBX can only set this today via the Aavaz Store. Remove this step
+            #      once the PBX sets it on its own (see README.md).
+            #
+            # Progress / errors: /var/log/cloud-init-output.log on the VM.
+            # =============================================================================
+
+            package_update: true
+            packages:
+              - ca-certificates
+              - curl
+
+            write_files:
+              - path: /usr/local/sbin/aavaz-pbx-cloud-install
+                permissions: "0750"
+                content: |
+                  #!/bin/bash
+                  #
+                  # Description: Aavaz PBX cloud install, run once by cloud-init.
+                  # Usage: aavaz-pbx-cloud-install
+
+                  set -euo pipefail
+
+                  readonly INSTALLER_URL="https://resources.aavaz.biz/install/aavaz-pbx-install.sh"
+                  readonly INSTALLER="/root/aavaz-pbx-install.sh"
+                  readonly REQUIRED_OS_ID="ubuntu"
+                  readonly REQUIRED_OS_VERSION="24.04"
+                  readonly CONTAINER="aavaz-pbx"
+                  readonly PJSIP_CONF="/mnt/aavazHost/config/asterisk/pjsip.conf"
+                  # Public IP: the Aavaz Store's open endpoint (returns {"ip":"..."}),
+                  # falling back to a plain-text lookup if the Store is unreachable.
+                  readonly STORE_IP_URL="https://store.aavaz.biz/api/v1/ips/client_ip"
+                  readonly FALLBACK_IP_URL="https://checkip.amazonaws.com"
+                  readonly IPV4_RE='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+
+                  # Prints this host's public IPv4 (first IPv4 in the reply), or nothing.
+                  function public_ip() {
+                    local url ip
+                    for url in "${STORE_IP_URL}" "${FALLBACK_IP_URL}"; do
+                      ip="$(curl -fsS --max-time 10 --retry 3 "${url}" 2>/dev/null \
+                        | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)" || true
+                      if [[ "${ip}" =~ ${IPV4_RE} ]]; then
+                        printf '%s' "${ip}"
+                        return 0
+                      fi
+                    done
+                  }
+
+                  # Writes external_*_address + local_net into [transport-udp], then
+                  # restarts the container (Asterisk ignores transport changes on reload).
+                  function set_nat_addresses() {
+                    local public_ip dev local_cidr
+                    for _ in $(seq 1 90); do
+                      grep -q '^\[transport-udp\]' "${PJSIP_CONF}" 2>/dev/null && break
+                      sleep 2
+                    done
+                    if ! grep -q '^\[transport-udp\]' "${PJSIP_CONF}" 2>/dev/null; then
+                      echo "Aavaz PBX: ${PJSIP_CONF} not created; NAT not set." >&2
+                      return 1
+                    fi
+                    if sed -n '/^\[transport-udp\]/,/^\[/p' "${PJSIP_CONF}" \
+                        | grep -q '^external_media_address='; then
+                      echo "Aavaz PBX: external address already set; leaving it."
+                      return 0
+                    fi
+
+                    public_ip="$(public_ip)"
+                    if [[ -z "${public_ip}" ]]; then
+                      echo "Aavaz PBX: could not read public IP; NAT not set." >&2
+                      return 1
+                    fi
+                    # Subnet route on the default interface (AWS, LANs). GCP gives the VM
+                    # a /32 and no subnet route: then no local_net, i.e. every peer is
+                    # treated as external, which is right for a lone cloud VM.
+                    dev="$(ip route show default | awk '{print $5; exit}')"
+                    local_cidr="$(ip -o -f inet route show dev "${dev}" \
+                      | awk '$1 ~ /\// {print $1; exit}')"
+
+                    sed -i "/^\[transport-udp\]/,/^bind=/{/^bind=/a\\
+                  external_media_address=${public_ip}\\
+                  external_signaling_address=${public_ip}
+                  }" "${PJSIP_CONF}"
+                    if [[ -n "${local_cidr}" ]]; then
+                      sed -i "/^external_signaling_address=${public_ip}\$/a local_net=${local_cidr}" \
+                        "${PJSIP_CONF}"
+                    fi
+                    docker restart "${CONTAINER}" >/dev/null
+                    echo "Aavaz PBX: NAT set (public ${public_ip}, local_net ${local_cidr:-none})."
+                  }
+
+                  function main() {
+                    # shellcheck source=/dev/null
+                    source /etc/os-release
+                    if [[ "${ID}" != "${REQUIRED_OS_ID}" \
+                          || "${VERSION_ID}" != "${REQUIRED_OS_VERSION}" ]]; then
+                      echo "Aavaz PBX: unsupported OS '${PRETTY_NAME}'." \
+                           "Use Ubuntu ${REQUIRED_OS_VERSION} LTS." >&2
+                      exit 1
+                    fi
+
+                    curl -fsSL --retry 5 --retry-delay 10 "${INSTALLER_URL}" -o "${INSTALLER}"
+                    bash "${INSTALLER}" --yes
+                    set_nat_addresses
+                  }
+
+                  main "$@"
+
+            runcmd:
+              - [/usr/local/sbin/aavaz-pbx-cloud-install]
+
+            final_message: "Aavaz PBX cloud-init finished after $UPTIME s. Open https://<public-ip>/ to log in."
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${AWS::StackName}-pbx" }
+          - ResourceType: volume
+            Tags:
+              - { Key: Name, Value: !Sub "${AWS::StackName}-pbx" }
+
+  Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: ElasticIpAssociation
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+
+Outputs:
+  PublicIp:
+    Description: Give this to your SIP trunk provider; it stays fixed while the stack exists.
+    Value: !Ref ElasticIp
+  ManagementUrl:
+    Description: Ready about 3 minutes after the stack completes (self-signed certificate warning is expected).
+    Value: !Sub "https://${ElasticIp}/"
+  SshAccess:
+    Description: With a key pair use ssh; without one use the EC2 console's Connect button.
+    Value: !If
+      - HasKeyName
+      - !Sub "ssh -i ${KeyName}.pem ubuntu@${ElasticIp}"
+      - "EC2 console > Instances > select the instance > Connect > EC2 Instance Connect"
+  InstallLog:
+    Description: Run after connecting, to watch or debug the install.
+    Value: sudo tail -f /var/log/cloud-init-output.log
+  NextStep:
+    Value: Log in, change the admin password, then open your current IP for SIP in the management app.

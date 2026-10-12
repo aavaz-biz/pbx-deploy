@@ -1,0 +1,126 @@
+#cloud-config
+# =============================================================================
+# Aavaz PBX - cloud first boot (Ubuntu 24.04 LTS only)
+# =============================================================================
+# Paste as "user data" on any cloud. gcp-deploy.sh passes this file as GCE
+# user-data metadata; aws-cloudformation.yaml embeds a verbatim copy (a Launch
+# Stack template must be self-contained): change both together.
+#
+# All install logic stays in the hosted installer (the one Docker Hub points
+# to); this file only:
+#   1. refuses any OS other than Ubuntu 24.04 (the one tested host)
+#   2. runs the installer unattended (--yes: with no terminal its prompts
+#      default to "no" and it aborts)
+#   3. WORKAROUND: writes the public IP into pjsip.conf so calls have audio.
+#      Cloud VMs only see their private IP; without external_media_address
+#      Asterisk advertises it in SDP and RTP goes nowhere (tested 2026-10-12).
+#      The PBX can only set this today via the Aavaz Store. Remove this step
+#      once the PBX sets it on its own (see README.md).
+#
+# Progress / errors: /var/log/cloud-init-output.log on the VM.
+# =============================================================================
+
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+
+write_files:
+  - path: /usr/local/sbin/aavaz-pbx-cloud-install
+    permissions: "0750"
+    content: |
+      #!/bin/bash
+      #
+      # Description: Aavaz PBX cloud install, run once by cloud-init.
+      # Usage: aavaz-pbx-cloud-install
+
+      set -euo pipefail
+
+      readonly INSTALLER_URL="https://resources.aavaz.biz/install/aavaz-pbx-install.sh"
+      readonly INSTALLER="/root/aavaz-pbx-install.sh"
+      readonly REQUIRED_OS_ID="ubuntu"
+      readonly REQUIRED_OS_VERSION="24.04"
+      readonly CONTAINER="aavaz-pbx"
+      readonly PJSIP_CONF="/mnt/aavazHost/config/asterisk/pjsip.conf"
+      # Public IP: the Aavaz Store's open endpoint (returns {"ip":"..."}),
+      # falling back to a plain-text lookup if the Store is unreachable.
+      readonly STORE_IP_URL="https://store.aavaz.biz/api/v1/ips/client_ip"
+      readonly FALLBACK_IP_URL="https://checkip.amazonaws.com"
+      readonly IPV4_RE='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+
+      # Prints this host's public IPv4 (first IPv4 in the reply), or nothing.
+      function public_ip() {
+        local url ip
+        for url in "${STORE_IP_URL}" "${FALLBACK_IP_URL}"; do
+          ip="$(curl -fsS --max-time 10 --retry 3 "${url}" 2>/dev/null \
+            | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)" || true
+          if [[ "${ip}" =~ ${IPV4_RE} ]]; then
+            printf '%s' "${ip}"
+            return 0
+          fi
+        done
+      }
+
+      # Writes external_*_address + local_net into [transport-udp], then
+      # restarts the container (Asterisk ignores transport changes on reload).
+      function set_nat_addresses() {
+        local public_ip dev local_cidr
+        for _ in $(seq 1 90); do
+          grep -q '^\[transport-udp\]' "${PJSIP_CONF}" 2>/dev/null && break
+          sleep 2
+        done
+        if ! grep -q '^\[transport-udp\]' "${PJSIP_CONF}" 2>/dev/null; then
+          echo "Aavaz PBX: ${PJSIP_CONF} not created; NAT not set." >&2
+          return 1
+        fi
+        if sed -n '/^\[transport-udp\]/,/^\[/p' "${PJSIP_CONF}" \
+            | grep -q '^external_media_address='; then
+          echo "Aavaz PBX: external address already set; leaving it."
+          return 0
+        fi
+
+        public_ip="$(public_ip)"
+        if [[ -z "${public_ip}" ]]; then
+          echo "Aavaz PBX: could not read public IP; NAT not set." >&2
+          return 1
+        fi
+        # Subnet route on the default interface (AWS, LANs). GCP gives the VM
+        # a /32 and no subnet route: then no local_net, i.e. every peer is
+        # treated as external, which is right for a lone cloud VM.
+        dev="$(ip route show default | awk '{print $5; exit}')"
+        local_cidr="$(ip -o -f inet route show dev "${dev}" \
+          | awk '$1 ~ /\// {print $1; exit}')"
+
+        sed -i "/^\[transport-udp\]/,/^bind=/{/^bind=/a\\
+      external_media_address=${public_ip}\\
+      external_signaling_address=${public_ip}
+      }" "${PJSIP_CONF}"
+        if [[ -n "${local_cidr}" ]]; then
+          sed -i "/^external_signaling_address=${public_ip}\$/a local_net=${local_cidr}" \
+            "${PJSIP_CONF}"
+        fi
+        docker restart "${CONTAINER}" >/dev/null
+        echo "Aavaz PBX: NAT set (public ${public_ip}, local_net ${local_cidr:-none})."
+      }
+
+      function main() {
+        # shellcheck source=/dev/null
+        source /etc/os-release
+        if [[ "${ID}" != "${REQUIRED_OS_ID}" \
+              || "${VERSION_ID}" != "${REQUIRED_OS_VERSION}" ]]; then
+          echo "Aavaz PBX: unsupported OS '${PRETTY_NAME}'." \
+               "Use Ubuntu ${REQUIRED_OS_VERSION} LTS." >&2
+          exit 1
+        fi
+
+        curl -fsSL --retry 5 --retry-delay 10 "${INSTALLER_URL}" -o "${INSTALLER}"
+        bash "${INSTALLER}" --yes
+        set_nat_addresses
+      }
+
+      main "$@"
+
+runcmd:
+  - [/usr/local/sbin/aavaz-pbx-cloud-install]
+
+final_message: "Aavaz PBX cloud-init finished after $UPTIME s. Open https://<public-ip>/ to log in."
